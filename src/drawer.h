@@ -2,26 +2,6 @@
 
 /* GeometryRenderer : drawing geometry to the G-Buffer */
 
-// list of meshes to be drawn + instance information
-struct DrawList
-{
-	uint total_meshes, total_instances;
-
-	// meshlist is an **ORDERED** list
-	// do we even need this?
-	uint meshlist[MAX_MESHES]; // mesh ids in order stored in mesh VBO (for matching instance data)
-
-	// params for issuing a draw call on an instanced mesh, in mesh VBO order
-	struct {
-		uint num_indices;
-		uint index_offset; // IN BYTES : num_indices * sizeof(uint)
-		uint base_vertex;  // IN VERTS : mesh_offset / sizeof(Vertex)
-		uint num_instances;
-		uint base_instance; // IN INSTANCES
-	} mesh_params[MAX_MESHES];
-
-};
-
 // instance data might not be in the same order as geometry data.
 // the number of instances of each mesh might vary every frame.
 // Therefore :
@@ -33,22 +13,33 @@ struct DrawList
 // TODO : should we check this & throw an error if called twice?
 struct DrawBuffer
 {	
-	// geometry buffers
-	GLuint meshes;    // vertices
-	GLuint indices;   // index data
+	struct {
+		uint mesh_id;
 
-	// instance buffer
-	GLuint instances; // instance data
+		uint num_indices;
+		uint index_offset; // IN BYTES : num_indices * sizeof(uint)
+		uint base_vertex;  // IN VERTS : mesh_offset / sizeof(Vertex)
 
-	uint geom_meshidlist[MAX_MESHES]; // list for geometry data
-	uint inst_meshidlist[MAX_MESHES]; // list for instance data
+		uint num_instances;
+		uint base_instance; // IN INSTANCES
+	} mesh_info[MAX_MESHES];
 
-	DrawList draw_list;
+	// OpenGL gpu buffers
+	GLuint geom_buffer; // handle to vertex buffer
+	GLuint indx_buffer; // handle to index 
+	GLuint inst_buffer; // handle to instance buffer
 
 	// runtime buffer info
 	uint max_buffer_size;
-	uint mesh_offset, index_offset;
-	uint mesh_size, index_size, instance_count;
+
+	uint num_meshes;
+	uint total_instances; // total number of instances currently stored
+
+	uint geom_size;
+	uint indx_size;
+	uint inst_size;
+
+	uint geom_offset, indx_offset;
 
 	void init(GLuint vao, uint buffer_size = KiloByte(256)) {
 
@@ -56,9 +47,9 @@ struct DrawBuffer
 		max_buffer_size = buffer_size;
 
 		// generate gpu buffers : mesh vertices, mesh indices, & instance data
-		glGenBuffers(1, &meshes);
-		glGenBuffers(1, &indices);
-		glGenBuffers(1, &instances);
+		glGenBuffers(1, &geom_buffer);
+		glGenBuffers(1, &indx_buffer);
+		glGenBuffers(1, &inst_buffer);
 
 		// IMPORTANT : bind the vao *before* binding anything else!
 		glBindVertexArray(vao);
@@ -71,7 +62,7 @@ struct DrawBuffer
 		};
 
 		// gpu buffer for mesh vertices
-		glBindBuffer(GL_ARRAY_BUFFER, meshes);
+		glBindBuffer(GL_ARRAY_BUFFER, geom_buffer);
 		glBufferData(GL_ARRAY_BUFFER, max_buffer_size, NULL, GL_STATIC_DRAW);
 
 		// this code tells opengl about the layout of mesh vertex data
@@ -86,7 +77,7 @@ struct DrawBuffer
 		// ------------------------------------------------------------------------------------
 
 		// gpu buffer for per-mesh instance data
-		glBindBuffer(GL_ARRAY_BUFFER, instances);
+		glBindBuffer(GL_ARRAY_BUFFER, inst_buffer);
 		glBufferData(GL_ARRAY_BUFFER, max_buffer_size, NULL, GL_DYNAMIC_DRAW);
 
 		// define per-mesh instance-data layout
@@ -99,7 +90,7 @@ struct DrawBuffer
 		}
 
 		// gpu index buffer : ordered uints that reference vertices for building meshes
-		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indx_buffer);
 		glBufferData(GL_ELEMENT_ARRAY_BUFFER, max_buffer_size, NULL, GL_STATIC_DRAW);
 
 		// log
@@ -111,8 +102,8 @@ struct DrawBuffer
 	// This function appends mesh vertices & indices to the appropriate gpu buffers
 	void add_geometry(uint mesh_id, Mesh_Data mesh_data) {
 
-		// this is used for storing vertex data in the correct format
-		// so it can be put into a gpu buffer to be drawn
+		// for storing vertex data in the correct format
+		// so it can go into a gpu buffer to be drawn
 		struct MeshVertex {
 			vec3 position, normal;
 			vec2 uv;
@@ -121,24 +112,22 @@ struct DrawBuffer
 		uint num_vertices = mesh_data.num_vertices;
 		uint num_indices  = mesh_data.num_indices;
 
-		uint vert_data_size = num_vertices * sizeof(MeshVertex);
-		uint index_data_size = num_indices * sizeof(uint);
-
-		uint new_meshvbo_size = mesh_offset + vert_data_size;
+		uint vert_data_size  = num_vertices * sizeof(MeshVertex);
+		uint index_data_size = num_indices  * sizeof(uint);
 
 		// Ensure new mesh data will fit in gpu buffers!
 
-		if (new_meshvbo_size > max_buffer_size) {
-			out("Mesh VBO size exceeded! - " << new_meshvbo_size);
+		if (geom_offset + vert_data_size > max_buffer_size) {
+			out("Geom VBO size exceeded! - " << geom_offset + vert_data_size);
 			stop;
 		}
 
-		if (index_offset + index_data_size > max_buffer_size) {
-			out("Index VBO size exceeded!");
+		if (indx_offset + index_data_size > max_buffer_size) {
+			out("Index VBO size exceeded! - " << indx_offset + index_data_size);
 			stop;
 		}
 
-		// update mesh vbo
+		// update geometry buffer
 
 		MeshVertex* mesh_verts = Alloc(MeshVertex, num_vertices);
 
@@ -147,56 +136,85 @@ struct DrawBuffer
 			mesh_verts[i] = MeshVertex{ mesh_data.positions[i], mesh_data.normals[i], mesh_data.uvs[i] };
 
 		// upload mesh data to gpu buffer
-		glBindBuffer(GL_ARRAY_BUFFER, meshes);
-		glBufferSubData(GL_ARRAY_BUFFER, mesh_offset, vert_data_size, mesh_verts);
+		glBindBuffer(GL_ARRAY_BUFFER, geom_buffer);
+		glBufferSubData(GL_ARRAY_BUFFER, geom_offset, vert_data_size, mesh_verts);
 
 		free(mesh_verts);
 
-		// update mesh index buffer
-		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
-		glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, index_offset, index_data_size, mesh_data.indices);
+		// update index buffer
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indx_buffer);
+		glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, indx_offset, index_data_size, mesh_data.indices);
 
-		// update draw-list
-		uint drawlist_index = draw_list.total_meshes;
-		draw_list.mesh_params[drawlist_index].base_vertex = mesh_offset / sizeof(MeshVertex);
-		draw_list.mesh_params[drawlist_index].num_indices = num_indices;
-		draw_list.mesh_params[drawlist_index].index_offset = index_offset;
-		draw_list.mesh_params[drawlist_index].num_instances = 1;
+		// update mesh info
+		uint mesh_index = num_meshes++;
+		mesh_info[mesh_index].mesh_id       = mesh_id;
+		mesh_info[mesh_index].base_vertex   = geom_offset / sizeof(MeshVertex);
+		mesh_info[mesh_index].num_indices   = num_indices;
+		mesh_info[mesh_index].index_offset  = indx_offset;
 
-		draw_list.total_meshes++;
-
-		// update VertexBuffer info
-		mesh_offset += vert_data_size;
-		index_offset += index_data_size;
-
-		for (uint i = 0; i < MAX_MESHES; i++)
-		{
-			if (draw_list.meshlist[i] == 0) // empty mesh slot found!
-			{
-				draw_list.meshlist[i] = mesh_id; // add this mesh to the list (in order!)
-				return;
-			}
-		}
+		// update offsets
+		geom_offset += vert_data_size;
+		indx_offset += index_data_size;
 	}
 
 	// This function appends per-mesh instance data to the appropriate gpu buffers
-	void add_instances(uint mesh_id, uint num_instances, mat4* instance_data) {
-		glBindBuffer(GL_ARRAY_BUFFER, instances);
+	void add_instances(uint mesh_id, uint num_instances, mat4* instance_data)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, inst_buffer);
 
-		uint instance_data_size = num_instances * sizeof(mat4); // IN BYTES
-		uint instance_offset = draw_list.total_instances * sizeof(mat4); // IN BYTES
+		uint instance_data_size = num_instances   * sizeof(mat4); // UNIT : BYTES
+		uint instance_offset    = total_instances * sizeof(mat4); // UNIT : BYTES
 
 		glBufferSubData(GL_ARRAY_BUFFER, instance_offset, instance_data_size, instance_data);
 
-		// look for corresponding mesh, append instance data, & update total instances
+		// update corresponding mesh info
 		for (uint i = 0; i < MAX_MESHES; i++)
 		{
-			if (draw_list.meshlist[i] == mesh_id)
+			if (mesh_info[i].mesh_id == mesh_id)
 			{
-				draw_list.mesh_params[i].base_instance = draw_list.total_instances;
-				draw_list.total_instances += num_instances;
+				mesh_info[i].num_instances = num_instances;
+				mesh_info[i].base_instance = total_instances; // UNIT : INSTANCES
+				total_instances += num_instances;
 				return;
 			}
+		}
+
+		out("ERROR : Instances do not match a stored mesh!");
+		stop;
+	}
+};
+
+// list of meshes to be drawn + instance information
+struct DrawList
+{
+	uint meshlist[MAX_MESHES]; // mesh ids in the list
+
+	// params for issuing a draw call on an instanced mesh, in mesh VBO order
+	struct {
+		uint num_indices;
+		uint index_offset; // IN BYTES : num_indices * sizeof(uint)
+		uint base_vertex;  // IN VERTS : mesh_offset / sizeof(Vertex)
+		uint num_instances;
+		uint base_instance; // IN INSTANCES
+	} mesh_params[MAX_MESHES];
+
+	void update(DrawBuffer* db)
+	{
+		*this = {}; // zero memory
+		db->total_instances = 0;
+
+		for (uint i = 0; i < MAX_MESHES; i++)
+		{
+			if (db->mesh_info[i].mesh_id == 0)
+				continue;
+
+			meshlist[i] = db->mesh_info[i].mesh_id;
+
+			mesh_params[i].num_indices   = db->mesh_info[i].num_indices;
+			mesh_params[i].index_offset  = db->mesh_info[i].index_offset;
+			mesh_params[i].base_vertex   = db->mesh_info[i].base_vertex;
+			mesh_params[i].num_instances = db->mesh_info[i].num_instances;
+			mesh_params[i].base_instance = db->mesh_info[i].base_instance;
 		}
 	}
 };
@@ -210,6 +228,7 @@ struct GeometryRenderer {
 	// caching & loading meshes
 	MeshLoader meshloader;
 	DrawBuffer drawbuffer;
+	DrawList   drawlist;
 
 	void init();
 	void add_mesh(const char* filepath);
@@ -288,18 +307,21 @@ void GeometryRenderer::draw(GameWindow* window)
 
 	//out("drawing total meshes : " << gpu_buffer.draw_list.total_meshes);
 
+	drawlist.update(&drawbuffer);
+
 	// draw each instanced mesh
-	for (uint i = 0; i < drawbuffer.draw_list.total_meshes; i++)
+	for (uint i = 0; i < MAX_MESHES; i++)
 	{
-		uint num_indices     = drawbuffer.draw_list.mesh_params[i].num_indices;
-		uint index_offset    = drawbuffer.draw_list.mesh_params[i].index_offset;
-		uint vertex_offset   = drawbuffer.draw_list.mesh_params[i].base_vertex;
-		uint num_instances   = drawbuffer.draw_list.mesh_params[i].num_instances;
-		uint instance_offset = drawbuffer.draw_list.mesh_params[i].base_instance;
+		if (drawlist.meshlist[i] == 0)
+			continue;
+
+		uint num_indices     = drawlist.mesh_params[i].num_indices;
+		uint index_offset    = drawlist.mesh_params[i].index_offset;
+		uint vertex_offset   = drawlist.mesh_params[i].base_vertex;
+		uint num_instances   = drawlist.mesh_params[i].num_instances;
+		uint instance_offset = drawlist.mesh_params[i].base_instance;
 
 		glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, num_indices, GL_UNSIGNED_INT,
 			(void*)index_offset, num_instances, vertex_offset, instance_offset);
-
-		drawbuffer.draw_list.total_instances = 0; // reset instance count for next frame
 	}
 }

@@ -36,7 +36,7 @@ int main()
 		model[2] = glm::translate(mat4(1), vec3(-1, 0, 0));
 		model[2] = glm::rotate(model[2], 360.f * runningTime, vec3(0, 1, 1));
 
-		geometry_renderer->drawbuffer.add_instances(1, 1, model);
+		geometry_renderer->drawbuffer.add_instances(1, 1, &model[0]);
 		geometry_renderer->drawbuffer.add_instances(2, 1, &model[1]);
 		geometry_renderer->drawbuffer.add_instances(3, 1, &model[2]);
 
